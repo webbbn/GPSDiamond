@@ -50,14 +50,16 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum {
+	      NMEA_COMPLETE,
+	      UBX_COMPLETE,
+	      MSG_IN_PROCESS,
+	      MSG_ERROR
+} MSGStatus;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define LED_PIN GPIO_PIN_5
-#define LED_GPIO_PORT GPIOA
-
 #define ERROR_MS56			(3)
 
 #define MS5637_I2C_ADDR 	(0xEC)
@@ -123,6 +125,7 @@ uint8_t itoa(int32_t x, uint8_t *str, uint8_t n, uint8_t d);
 uint8_t ftoa(float x, uint8_t *str, uint8_t n, uint8_t afterpoint);
 void ubx_checksum(uint8_t *msg);
 int nmea_checksum(const char *s);
+MSGStatus parse_msg(uint8_t val);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -199,10 +202,6 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   char buf[RX_BUFFER_SIZE];
-  uint8_t NMEA_msg_len = 0;
-  uint8_t UBX_msg_len = 0;
-  uint8_t UBX_payload_len = 0;
-  uint8_t parsing_UBX = 0;
   uint32_t loop_counter = 0;
   uint32_t last_valid_message = 0;
   while (1) {
@@ -226,75 +225,41 @@ int main(void)
       // Write the byte to the output channel.
       HAL_UART_Transmit(&huart1, &val, 1, 0xFFFF);
 
-      // Are we parsing an NMEA message?
-      if (NMEA_msg_len) {
-	++NMEA_msg_len;
-	parsing_UBX = 0;
-	// Is this message too long, or are we missing the start delminter?
-	if ((NMEA_msg_len > 82) || ((NMEA_msg_len == 7) && (val != ','))) {
-	  NMEA_msg_len = 0;
-	  HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-	} else if (val == '\n') {
-	  // We recieved the end of a frame.
-	  NMEA_msg_len = 0;
-	  last_valid_message = 0;
-	}
-      } else if (UBX_msg_len) {
-	// Are we parsing a UBX message?
-	parsing_UBX = 1;
-	++UBX_msg_len;
-	if (UBX_msg_len == 2) {
-	  // Is this the second sync char?
-	  if (val == 0x62) {
-	    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
-	  } else {
-	    UBX_msg_len = 0;
-	  }
-	} else if (UBX_msg_len == 5) {
-	  // This should be the high byte of the length field.
-	  // It's little-endian, so this is the least significant byte.
-	  UBX_payload_len = val;
-	} else if (UBX_msg_len == 6) {
-	  // None of the messages that we are interested in are longer than 255 bytes.
-	  // If this value is non-zero, we must have a parsing error.
-	  if (val) {
-	    HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
-	    UBX_msg_len = 0;
-	  }
-	} else if (UBX_msg_len == (UBX_payload_len + 8)) {
-	  UBX_msg_len = 0;
-	  last_valid_message = 0;
-	}
-      } else if (val == '$') {
-	// Start of NMEA message.
-	NMEA_msg_len = 1;
+      MSGStatus status = parse_msg(val);
+      switch (status) {
+      case NMEA_COMPLETE:
+      case UBX_COMPLETE:
+	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+	last_valid_message = 0;
+	break;
+      case MSG_IN_PROCESS:
 	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
-      } if (val == 0xB5) {
-	// Start of UBX message.
-	UBX_msg_len = 1;
+	break;
+      case MSG_ERROR:
+	HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
+	break;
       }
 
-      if ((UBX_msg_len == 0) && (NMEA_msg_len == 0)) {
-	if (loop_counter > SENSOR_SAMPLE_RATE) {
-	  if (parsing_UBX) {
-	  } else {
-	    // Read the pressure/temperature sensor.
-	    float temperature;
-	    float pressure;
-	    float altitude;
-	    MS5637_ReadData(&temperature, &pressure, &altitude);
-	    uint8_t flen;
-	    HAL_UART_Transmit(&huart1, (uint8_t *)"$GPBAR,1,", 9, 0xFFFF);
-	    flen = ftoa(temperature, nmea_buffer, 20, 3);
-	    HAL_UART_Transmit(&huart1, nmea_buffer, flen, 0xFFFF);
-	    HAL_UART_Transmit(&huart1, (uint8_t*)",", 1, 0xFFFF);
-	    flen = ftoa(pressure, nmea_buffer, 10, 3);
-	    HAL_UART_Transmit(&huart1, nmea_buffer, flen, 0xFFFF);
-	    HAL_UART_Transmit(&huart1, (uint8_t*)",", 1, 0xFFFF);
-	    flen = ftoa(altitude, nmea_buffer, 20, 3);
-	    HAL_UART_Transmit(&huart1, nmea_buffer, flen, 0xFFFF);
-	    HAL_UART_Transmit(&huart1, (uint8_t*)"\r\n", 2, 0xFFFF);
-	  }
+      if (loop_counter > SENSOR_SAMPLE_RATE) {
+	if (status == NMEA_COMPLETE) {
+	  // Read the pressure/temperature sensor.
+	  float temperature;
+	  float pressure;
+	  float altitude;
+	  MS5637_ReadData(&temperature, &pressure, &altitude);
+	  uint8_t flen;
+	  HAL_UART_Transmit(&huart1, (uint8_t *)"$GPBAR,1,", 9, 0xFFFF);
+	  flen = ftoa(temperature, nmea_buffer, 20, 3);
+	  HAL_UART_Transmit(&huart1, nmea_buffer, flen, 0xFFFF);
+	  HAL_UART_Transmit(&huart1, (uint8_t*)",", 1, 0xFFFF);
+	  flen = ftoa(pressure, nmea_buffer, 10, 3);
+	  HAL_UART_Transmit(&huart1, nmea_buffer, flen, 0xFFFF);
+	  HAL_UART_Transmit(&huart1, (uint8_t*)",", 1, 0xFFFF);
+	  flen = ftoa(altitude, nmea_buffer, 20, 3);
+	  HAL_UART_Transmit(&huart1, nmea_buffer, flen, 0xFFFF);
+	  HAL_UART_Transmit(&huart1, (uint8_t*)"\r\n", 2, 0xFFFF);
+	  loop_counter = 0;
+	} else if (status == UBX_COMPLETE) {
 	  loop_counter = 0;
 	}
       }
@@ -303,6 +268,7 @@ int main(void)
 
     // Reset the UART if we don't recieve a message for a while.
     if (++last_valid_message > RESET_THRESHOLD) {
+      HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
       HAL_UART_Init(&huart2);
       MX_USART2_UART_Init();
       HAL_UART_Receive_IT(&huart2, Rx_data2, 1);
@@ -326,7 +292,7 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-  /**Initializes the CPU, AHB and APB busses clocks 
+  /** Initializes the CPU, AHB and APB busses clocks 
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
@@ -339,7 +305,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  /**Initializes the CPU, AHB and APB busses clocks 
+  /** Initializes the CPU, AHB and APB busses clocks 
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1;
@@ -388,13 +354,13 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
-  /**Configure Analogue filter 
+  /** Configure Analogue filter 
   */
   if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
   {
     Error_Handler();
   }
-  /**Configure Digital filter 
+  /** Configure Digital filter 
   */
   if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
   {
@@ -465,8 +431,8 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_AUTOBAUDRATE_INIT;
   //huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_AUTOBAUDRATE_INIT;
   if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
@@ -511,7 +477,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-//Interrupt callback routine
+// Interrupt/DMA callback routine
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
 
@@ -563,7 +529,7 @@ static void errorHandler(uint8_t source, uint8_t errorId) {
     doSleepStop_WakeRTC_RTCCLK(1500);
 
     for (i=0; i<errorId; i++) {
-      HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
       doSleepStop_WakeRTC_RTCCLK(50);
       HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
       doSleepStop_WakeRTC_RTCCLK(450);
@@ -848,6 +814,60 @@ int nmea_checksum(const char *s) {
   while(*s)
     c ^= *s++;
   return c;
+}
+
+MSGStatus parse_msg(uint8_t val) {
+  static uint8_t NMEA_msg_len = 0;
+  static uint8_t UBX_msg_len = 0;
+  static uint8_t UBX_payload_len = 0;
+  static uint8_t parsing_UBX = 0;
+
+  // Are we parsing an NMEA message?
+  if (NMEA_msg_len) {
+    ++NMEA_msg_len;
+    parsing_UBX = 0;
+    // Is this message too long, or are we missing the start delminter?
+    if ((NMEA_msg_len > 82) || ((NMEA_msg_len == 7) && (val != ','))) {
+      NMEA_msg_len = 0;
+      return MSG_IN_PROCESS;
+    } else if (val == '\n') {
+      // We recieved the end of a frame.
+      NMEA_msg_len = 0;
+      return NMEA_COMPLETE;
+    }
+  } else if (UBX_msg_len) {
+    // Are we parsing a UBX message?
+    parsing_UBX = 1;
+    ++UBX_msg_len;
+    if (UBX_msg_len == 2) {
+      // Is this the second sync char?
+      if (val != 0x62) {
+	UBX_msg_len = 0;
+	return MSG_ERROR;
+      }
+    } else if (UBX_msg_len == 5) {
+      // This should be the high byte of the length field.
+      // It's little-endian, so this is the least significant byte.
+      UBX_payload_len = val;
+    } else if (UBX_msg_len == 6) {
+      // None of the messages that we are interested in are longer than 255 bytes.
+      // If this value is non-zero, we must have a parsing error.
+      if (val) {
+	UBX_msg_len = 0;
+	return MSG_ERROR;
+      }
+    } else if (UBX_msg_len == (UBX_payload_len + 8)) {
+      UBX_msg_len = 0;
+      return UBX_COMPLETE;
+    }
+  } else if (val == '$') {
+    // Start of NMEA message.
+    NMEA_msg_len = 1;
+  } if (val == 0xB5) {
+    // Start of UBX message.
+    UBX_msg_len = 1;
+  }
+  return MSG_IN_PROCESS;
 }
 
 /* USER CODE END 4 */
